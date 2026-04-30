@@ -1,68 +1,70 @@
 # tokimo-package-pg
 
-预编译的 PostgreSQL + pgvector，用于嵌入 Tauri 桌面应用。
+Prebuilt portable PostgreSQL + pgvector for embedding in desktop applications.
 
-## 产物
+## Artifacts
 
-每次构建产出两个平台的可移植 zip 包：
+Each build produces platform-specific relocatable zip archives:
 
-| 平台 | 架构 | 文件名 |
+| Platform | Arch | File |
 |---|---|---|
-| Windows | x64 (MSVC) | `pg-{版本}-windows-x64.zip` |
-| macOS | arm64 (Apple Silicon) | `pg-{版本}-macos-arm64.zip` |
+| Windows | x64 (MSVC) | `pg-{version}-windows-x64.zip` |
+| macOS | arm64 (Apple Silicon) | `pg-{version}-macos-arm64.zip` |
 
-zip 解压后是可独立运行的 PostgreSQL 安装目录，包含 `bin/`、`lib/`、`share/`，可嵌入 Tauri sidecar。
+The zip contains a standalone PostgreSQL installation (`bin/`, `lib/`, `share/`). Unzip anywhere and run — no installer, no system dependencies.
 
-## CI 参数
+## CI Parameters
 
-在 [Actions](https://github.com/tokimo-lab/tokimo-package-pg/actions) 页面手动触发，可配置：
+Trigger manually from [Actions](https://github.com/tokimo-lab/tokimo-package-pg/actions):
 
-| 参数 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `pg_version` | `REL_18_3` | PostgreSQL 源码 git tag |
-| `pgvector_version` | `v0.8.2` | pgvector 源码 git tag |
-| `ssl` | `false` | 是否编译 OpenSSL 支持 |
+| `pg_version` | `REL_18_3` | PostgreSQL source git tag |
+| `pgvector_version` | `v0.8.2` | pgvector source git tag |
+| `ssl` | `false` | Build with OpenSSL support |
 
-每次构建自动以 `pg{版本}-vec{版本}` 格式打 tag 并发布 Release。
+Each build auto-generates a `pg{ver}-vec{ver}` git tag and publishes a Release.
 
-## 已验证
+Every push to `master` triggers a CI build (nightly).
 
-CI 中每平台均执行：
+## Verified
 
-1. `initdb` 初始化数据库集群
-2. `pg_ctl start` 启动 PostgreSQL
-3. `CREATE EXTENSION vector` 加载 pgvector
-4. 向量插入、L2 距离查询、IVFFlat 索引创建
-5. `pg_ctl stop` 正常关闭
+CI runs these checks per platform, per build:
 
-## Tauri 集成
+1. `initdb` — initialize a database cluster
+2. `pg_ctl start` — start PostgreSQL
+3. `CREATE EXTENSION vector` — load pgvector
+4. Vector insert, L2 distance query, IVFFlat index creation
+5. `pg_ctl stop` — clean shutdown
+
+## Tauri Integration
 
 ```
 tauri-app/
   src-tauri/
     binaries/
-      pg-windows-x64/    ← 解压到此
+      pg-windows-x64/    ← unzip here
         bin/postgres.exe
         bin/initdb.exe
         lib/
         share/
 ```
 
-在 Tauri `tauri.conf.json` 中配置为 external binary，通过 `Command::new_sidecar` 调用 `initdb`、`postgres` 等命令。
+Configure as an external binary in `tauri.conf.json` and invoke `initdb`, `postgres`, etc. via `Command::new_sidecar`.
 
-## 本地构建
+## Local Build
 
 ```bash
-# 需要 meson, ninja, C 编译器
+# Requires: meson, ninja, C compiler
 
-# 编译 PG
+# Build PostgreSQL
 git clone --depth 1 --branch REL_18_3 https://github.com/postgres/postgres.git
 cd postgres
 meson setup build --prefix=/path/to/install --buildtype=release -Dssl=none
 ninja -C build
 ninja -C build install
 
-# 编译 pgvector
+# Build pgvector
 git clone --depth 1 --branch v0.8.2 https://github.com/pgvector/pgvector.git
 cd pgvector
 export PATH=/path/to/install/bin:$PATH
