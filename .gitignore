@@ -1,0 +1,7 @@
+pg-source/
+pgvector-source/
+pg-install/
+pgdata/
+*.zip
+*.tar.gz
+.vs/

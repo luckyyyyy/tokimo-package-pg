@@ -1,0 +1,347 @@
+name: Build PostgreSQL + pgvector
+
+on:
+  workflow_dispatch:
+    inputs:
+      pg_version:
+        description: 'PostgreSQL version (git tag, e.g. REL_17_5)'
+        required: true
+        default: 'REL_17_5'
+      pgvector_version:
+        description: 'pgvector version (git tag, e.g. v0.8.0)'
+        required: true
+        default: 'v0.8.0'
+      release_tag:
+        description: 'Release tag name (e.g. pg17-vector08)'
+        required: true
+        default: 'latest'
+      ssl:
+        description: 'Build with OpenSSL support'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: PG ${{ inputs.pg_version }} + pgvector (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-latest
+            os: windows
+          - target: macos-arm64
+            runner: macos-14
+            os: macos
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
+    env:
+      PG_VERSION: ${{ inputs.pg_version || 'REL_17_5' }}
+      PGVECTOR_VERSION: ${{ inputs.pgvector_version || 'v0.8.0' }}
+      RELEASE_TAG: ${{ inputs.release_tag || 'latest' }}
+      PG_INSTALL_DIR: ${{ github.workspace }}/pg-install
+      PGDATA: ${{ runner.temp }}/pgdata
+      ARTIFACT_NAME: pg-${{ inputs.pg_version || 'REL_17_5' }}-${{ matrix.target }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # ==================== WINDOWS ====================
+      - name: Install build tools (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install meson ninja
+
+      - name: Install OpenSSL (Windows)
+        if: matrix.os == 'windows' && inputs.ssl == 'true'
+        shell: pwsh
+        run: |
+          choco install openssl --no-progress -y
+          echo "OPENSSL_ROOT_DIR=C:\Program Files\OpenSSL-Win64" >> $env:GITHUB_ENV
+
+      - name: Clone PostgreSQL (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch $env:PG_VERSION https://github.com/postgres/postgres.git pg-source
+          Write-Host "PostgreSQL source cloned: $env:PG_VERSION"
+
+      - name: Build PostgreSQL with Meson (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          # Run meson/ninja inside a VS developer command prompt so MSVC is available
+          $sslOpt = if ('${{ inputs.ssl }}' -eq 'true') { '-Dssl=openssl' } else { '-Dssl=none' }
+          $installDir = $env:PG_INSTALL_DIR -replace '\\', '/'
+
+          $script = @"
+          @echo off
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" > nul
+          cd pg-source
+          meson setup build --prefix=$installDir --buildtype=release $sslOpt -Dcassert=false -Dzlib=enabled -Dnls=disabled -Dplperl=disabled -Dpltcl=disabled -Dplpython=disabled -Dldap=disabled -Dgssapi=disabled -Dicu=disabled -Dxml=disabled -Dllvm=disabled -Dselinux=disabled -Dsystemd=disabled -Duuid=e2fs -Dreadline=disabled -Dlibedit_preferred=false -Dpgport=15432
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+          ninja -C build
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+          ninja -C build install
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+          "@
+          $script | Out-File -FilePath "$env:RUNNER_TEMP\build-pg.bat" -Encoding ASCII
+          cmd /c "$env:RUNNER_TEMP\build-pg.bat"
+          if ($LASTEXITCODE -ne 0) { throw "PG build failed" }
+          Write-Host "PostgreSQL installed to: $env:PG_INSTALL_DIR"
+
+      - name: Build pgvector (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch $env:PGVECTOR_VERSION https://github.com/pgvector/pgvector.git pgvector-source
+          cd pgvector-source
+
+          $env:PATH = "$env:PG_INSTALL_DIR\bin;$env:PATH"
+          $env:PG_INSTALL_DIR_BS = $env:PG_INSTALL_DIR -replace '\\', '/'
+
+          $script = @"
+          @echo off
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" > nul
+          cd pgvector-source
+          set PATH=%PG_INSTALL_DIR%\bin;%PATH%
+          set PG_INSTALL_DIR=$env:PG_INSTALL_DIR_BS
+          nmake /F Makefile.win
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+          nmake /F Makefile.win install
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+          "@
+          $script | Out-File -FilePath "$env:RUNNER_TEMP\build-pgvector.bat" -Encoding ASCII
+          cmd /c "$env:RUNNER_TEMP\build-pgvector.bat"
+          if ($LASTEXITCODE -ne 0) { throw "pgvector build failed" }
+          Write-Host "pgvector installed"
+
+      - name: Test PostgreSQL + pgvector (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:PG_INSTALL_DIR\bin;$env:PATH"
+
+          # Initialize database cluster
+          initdb.exe -D $env:PGDATA --no-locale --encoding=UTF8 --auth=trust --username="$env:USERNAME"
+
+          # Minimal postgresql.conf for testing
+          Add-Content "$env:PGDATA\postgresql.conf" "listen_addresses = ''"
+          Add-Content "$env:PGDATA\postgresql.conf" "max_connections = 5"
+          Add-Content "$env:PGDATA\postgresql.conf" "shared_preload_libraries = ''"
+
+          # Start PostgreSQL
+          pg_ctl.exe start -D $env:PGDATA -l "$env:RUNNER_TEMP\pg.log" -w -t 30
+
+          if (Get-Content "$env:RUNNER_TEMP\pg.log" | Select-String "database system is ready") {
+            Write-Host "PostgreSQL started successfully"
+          } else {
+            Get-Content "$env:RUNNER_TEMP\pg.log"
+            throw "PostgreSQL failed to start"
+          }
+
+          # Create test database
+          createdb.exe -h localhost -p 15432 -U "$env:USERNAME" testdb
+
+          # Test pgvector extension
+          psql.exe -h localhost -p 15432 -U "$env:USERNAME" -d testdb -c "CREATE EXTENSION vector;"
+          psql.exe -h localhost -p 15432 -U "$env:USERNAME" -d testdb -c "SELECT '[1,2,3]'::vector;"
+
+          # Functional test
+          psql.exe -h localhost -p 15432 -U "$env:USERNAME" -d testdb -c "CREATE TABLE items (id serial PRIMARY KEY, embedding vector(3));"
+          psql.exe -h localhost -p 15432 -U "$env:USERNAME" -d testdb -c "INSERT INTO items (embedding) VALUES ('[1,2,3]'), ('[4,5,6]'), ('[2,3,4]');"
+          psql.exe -h localhost -p 15432 -U "$env:USERNAME" -d testdb -c "SELECT id, embedding, embedding <-> '[3,1,2]'::vector AS distance FROM items ORDER BY distance;"
+
+          # Verify index creation works
+          psql.exe -h localhost -p 15432 -U "$env:USERNAME" -d testdb -c "CREATE INDEX ON items USING ivfflat (embedding vector_l2_ops) WITH (lists = 1);"
+
+          pg_ctl.exe stop -D $env:PGDATA -m fast
+          Write-Host "All Windows tests passed!"
+
+      - name: Package artifact (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $artifactDir = "$env:RUNNER_TEMP\$env:ARTIFACT_NAME"
+          Move-Item -Path $env:PG_INSTALL_DIR -Destination $artifactDir
+
+          # Strip development files
+          Remove-Item -Recurse -Force "$artifactDir\include" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$artifactDir\doc" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$artifactDir\share\doc" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$artifactDir\share\man" -ErrorAction SilentlyContinue
+
+          Compress-Archive -Path $artifactDir -DestinationPath "$env:RUNNER_TEMP\$env:ARTIFACT_NAME.zip" -CompressionLevel Optimal
+          $size = (Get-Item "$env:RUNNER_TEMP\$env:ARTIFACT_NAME.zip").Length / 1MB
+          Write-Host "Packaged: $env:RUNNER_TEMP\$env:ARTIFACT_NAME.zip ($([math]::Round($size,1)) MB)"
+
+      # ==================== MACOS ====================
+      - name: Install build tools (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          brew install meson ninja pkg-config
+          if [ "${{ inputs.ssl }}" = "true" ]; then
+            brew install openssl
+            echo "PKG_CONFIG_PATH=$(brew --prefix openssl)/lib/pkgconfig" >> $GITHUB_ENV
+          fi
+
+      - name: Clone PostgreSQL (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          git clone --depth 1 --branch $PG_VERSION https://github.com/postgres/postgres.git pg-source
+
+      - name: Build PostgreSQL with Meson (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          cd pg-source
+
+          SSL_OPT="none"
+          if [ "${{ inputs.ssl }}" = "true" ]; then
+            SSL_OPT="openssl"
+          fi
+
+          meson setup build \
+            --prefix="$PG_INSTALL_DIR" \
+            --buildtype=release \
+            -Dssl=$SSL_OPT \
+            -Dcassert=false \
+            -Dzlib=enabled \
+            -Dnls=disabled \
+            -Dplperl=disabled \
+            -Dpltcl=disabled \
+            -Dplpython=disabled \
+            -Dldap=disabled \
+            -Dgssapi=disabled \
+            -Dicu=disabled \
+            -Dxml=disabled \
+            -Dllvm=disabled \
+            -Dselinux=disabled \
+            -Dsystemd=disabled \
+            -Duuid=e2fs \
+            -Dreadline=disabled \
+            -Dlibedit_preferred=false \
+            -Dpgport=15432
+
+          ninja -C build
+          ninja -C build install
+
+      - name: Fix macOS library paths (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          # Make PG relocatable: fix dylib install names to use @loader_path
+          for lib in "$PG_INSTALL_DIR/lib/"*.dylib; do
+            if [ -f "$lib" ] && [ ! -L "$lib" ]; then
+              install_name_tool -id "@loader_path/$(basename "$lib")" "$lib" 2>/dev/null || true
+            fi
+          done
+          # Fix executables
+          for bin in "$PG_INSTALL_DIR/bin/"*; do
+            if [ -f "$bin" ] && file "$bin" | grep -q Mach-O; then
+              for lib in "$PG_INSTALL_DIR/lib/"*.dylib; do
+                libname=$(basename "$lib")
+                if otool -L "$bin" 2>/dev/null | grep -q "$libname"; then
+                  install_name_tool -change "$lib" "@executable_path/../lib/$libname" "$bin" 2>/dev/null || true
+                fi
+              done
+            fi
+          done
+          echo "Library paths fixed for relocatable build"
+
+      - name: Build pgvector (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          git clone --depth 1 --branch $PGVECTOR_VERSION https://github.com/pgvector/pgvector.git pgvector-source
+          cd pgvector-source
+          export PATH="$PG_INSTALL_DIR/bin:$PATH"
+          make OPTFLAGS="-O2"
+          make install
+
+      - name: Test PostgreSQL + pgvector (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          export PATH="$PG_INSTALL_DIR/bin:$PATH"
+          export DYLD_LIBRARY_PATH="$PG_INSTALL_DIR/lib"
+
+          # Initialize database cluster
+          initdb -D "$PGDATA" --no-locale --encoding=UTF8 --auth=trust --username="$(whoami)"
+
+          # Minimal postgresql.conf for testing
+          cat >> "$PGDATA/postgresql.conf" <<'PGEOCONF'
+          listen_addresses = ''
+          max_connections = 5
+          shared_preload_libraries = ''
+          PGEOCONF
+
+          # Start PostgreSQL
+          pg_ctl start -D "$PGDATA" -l "$RUNNER_TEMP/pg.log" -w -t 30
+
+          if grep -q "database system is ready" "$RUNNER_TEMP/pg.log"; then
+            echo "PostgreSQL started successfully"
+          else
+            cat "$RUNNER_TEMP/pg.log"
+            exit 1
+          fi
+
+          # Create test database
+          createdb -h localhost -p 15432 -U "$(whoami)" testdb
+
+          # Test pgvector extension
+          psql -h localhost -p 15432 -U "$(whoami)" -d testdb -c "CREATE EXTENSION vector;"
+          psql -h localhost -p 15432 -U "$(whoami)" -d testdb -c "SELECT '[1,2,3]'::vector;"
+
+          # Functional test
+          psql -h localhost -p 15432 -U "$(whoami)" -d testdb -c "CREATE TABLE items (id serial PRIMARY KEY, embedding vector(3));"
+          psql -h localhost -p 15432 -U "$(whoami)" -d testdb -c "INSERT INTO items (embedding) VALUES ('[1,2,3]'), ('[4,5,6]'), ('[2,3,4]');"
+          psql -h localhost -p 15432 -U "$(whoami)" -d testdb -c "SELECT id, embedding, embedding <-> '[3,1,2]'::vector AS distance FROM items ORDER BY distance;"
+          psql -h localhost -p 15432 -U "$(whoami)" -d testdb -c "CREATE INDEX ON items USING ivfflat (embedding vector_l2_ops) WITH (lists = 1);"
+
+          pg_ctl stop -D "$PGDATA" -m fast
+          echo "All macOS tests passed!"
+
+      - name: Package artifact (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          ARTIFACT_DIR="$RUNNER_TEMP/$ARTIFACT_NAME"
+          mv "$PG_INSTALL_DIR" "$ARTIFACT_DIR"
+
+          # Strip development files
+          rm -rf "$ARTIFACT_DIR/include"
+          rm -rf "$ARTIFACT_DIR/doc"
+          rm -rf "$ARTIFACT_DIR/share/doc"
+          rm -rf "$ARTIFACT_DIR/share/man"
+
+          cd "$RUNNER_TEMP"
+          zip -r -9 "$ARTIFACT_NAME.zip" "$ARTIFACT_NAME"
+          size_mb=$(du -m "$ARTIFACT_NAME.zip" | cut -f1)
+          echo "Packaged: $RUNNER_TEMP/$ARTIFACT_NAME.zip (${size_mb} MB)"
+
+      # ==================== UPLOAD & RELEASE ====================
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}.zip
+          retention-days: 7
+
+      - name: Upload to Release
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          artifacts: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}.zip
+          tag: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          makeLatest: true
+          prerelease: ${{ env.RELEASE_TAG == 'latest' }}
+          replacesArtifacts: true
