@@ -1,6 +1,11 @@
 name: Build PostgreSQL + pgvector
 
 on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
   workflow_dispatch:
     inputs:
       pg_version:
